@@ -19,7 +19,7 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 # CONFIGURATION
 # ============================
 # HARDCODED VALUES
-TELEGRAM_BOT_TOKEN = "7793179311:AAEcPTzRlwFxg3lDPLrt6UktqfDsq8-K2Mk"
+TELEGRAM_BOT_TOKEN = "8456794085:AAHY0lQN4kdiFfcl-nmUE39cY3PMhFSIlaU"
 PORT = 5000
 WEBHOOK_BASE_URL = "https://web-production-25142.up.railway.app"  # YOUR RAILWAY URL
 
