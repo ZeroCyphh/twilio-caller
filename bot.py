@@ -19,9 +19,9 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 # CONFIGURATION
 # ============================
 # HARDCODED VALUES
-TELEGRAM_BOT_TOKEN = "8430938710:AAFnZ0mhtiiiZ8ZBr4yPeVY8k-q6i4hJIII"
+TELEGRAM_BOT_TOKEN = "8430938710:iiZ8ZBr4yPeVY8k-q6i4hJIII"
 PORT = 5000
-WEBHOOK_BASE_URL = "https://web-production-25142.up.railway.app"  # YOUR RAILWAY URL
+WEBHOOK_BASE_URL = "https://web-production.up.railway.app"  # YOUR RAILWAY URL
 
 # AUTO-GENERATE ENCRYPTION KEY
 def get_encryption_key():
